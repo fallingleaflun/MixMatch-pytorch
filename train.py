@@ -24,7 +24,7 @@ from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
-parser.add_argument('--epochs', default=1024, type=int, metavar='N',
+parser.add_argument('--epochs', default=1, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -43,14 +43,14 @@ parser.add_argument('--gpu', default='0', type=str,
 #Method options
 parser.add_argument('--n-labeled', type=int, default=250,
                         help='Number of labeled data')
-parser.add_argument('--train-iteration', type=int, default=1024,
+parser.add_argument('--train-iteration', type=int, default=4,
                         help='Number of iteration per epoch')
 parser.add_argument('--out', default='result',
                         help='Directory to output the result')
 parser.add_argument('--alpha', default=0.75, type=float)
 parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
-parser.add_argument('--ema-decay', default=0.999, type=float)
+parser.add_argument('--ema-decay', default=0.999, type=float) # ema是Mean Teacher的trick，会在生产guess标签时对模型参数进行滑动平均
 
 
 args = parser.parse_args()
@@ -75,12 +75,14 @@ def main():
 
     # Data
     print(f'==> Preparing cifar10')
+    # 测试集数据增广，API好像是随机的执行的
     transform_train = transforms.Compose([
         dataset.RandomPadandCrop(32),
         dataset.RandomFlip(),
         dataset.ToTensor(),
     ])
 
+    # 验证集无数据增广
     transform_val = transforms.Compose([
         dataset.ToTensor(),
     ])
@@ -93,15 +95,13 @@ def main():
 
     # Model
     print("==> creating WRN-28-2")
-
     def create_model(ema=False):
         model = models.WideResNet(num_classes=10)
-        model = model.cuda()
-
+        if use_cuda:
+            model = model.cuda()
         if ema:
             for param in model.parameters():
                 param.detach_()
-
         return model
 
     model = create_model()
@@ -200,13 +200,13 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     model.train()
     for batch_idx in range(args.train_iteration):
         try:
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = labeled_train_iter.next() # [(B, C, N, N), (B,)]; B是batchsize, C是通道数, N是图片宽高
         except:
             labeled_train_iter = iter(labeled_trainloader)
             inputs_x, targets_x = labeled_train_iter.next()
-
+            
         try:
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next() # [[(B, C, N, N), (B, C, N, N)], (B,)]; (B,)全是-1
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
             (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
@@ -226,46 +226,47 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
 
 
         with torch.no_grad():
+            # 本样例代码只做一次增广，所以直接就这样写了
+            # 具体就是把所有U数据增广而得的数据作为模型输入再求label均值, 这部分只是用模型算label，不更新模型！
             # compute guessed labels of unlabel samples
             outputs_u = model(inputs_u)
             outputs_u2 = model(inputs_u2)
             p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1)) / 2
-            pt = p**(1/args.T)
-            targets_u = pt / pt.sum(dim=1, keepdim=True)
-            targets_u = targets_u.detach()
+            pt = p**(1/args.T) # sharpen操作
+            targets_u = pt / pt.sum(dim=1, keepdim=True) # sharpen操作
+            targets_u = targets_u.detach() # guess标签
 
         # mixup
         all_inputs = torch.cat([inputs_x, inputs_u, inputs_u2], dim=0)
         all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
 
         l = np.random.beta(args.alpha, args.alpha)
-
-        l = max(l, 1-l)
+        l = max(l, 1-l) # 取beta分布得到的接近1的值（beta分布就是有很大概率取接近0的值或接近1的值）,这是为了之后的以a为主以b为辅
 
         idx = torch.randperm(all_inputs.size(0))
-
-        input_a, input_b = all_inputs, all_inputs[idx]
+        input_a, input_b = all_inputs, all_inputs[idx] # a打乱顺序之后是b，但是其实还是以a为主，以b为辅
         target_a, target_b = all_targets, all_targets[idx]
+        mixed_input = l * input_a + (1 - l) * input_b # 随便mix
+        mixed_target = l * target_a + (1 - l) * target_b # 标签也是随便mix
 
-        mixed_input = l * input_a + (1 - l) * input_b
-        mixed_target = l * target_a + (1 - l) * target_b
-
-        # interleave labeled and unlabed samples between batches to get correct batchnorm calculation 
-        mixed_input = list(torch.split(mixed_input, batch_size))
+        # interleave labeled and unlabed samples between batches to get correct batchnorm calculation
+        # 还要继续通过interleave打乱来防止BN有bias，据说这一步还挺重要的
+        mixed_input = list(torch.split(mixed_input, batch_size)) # 每块是batchsize大小, 一共有3块(其实就是[有标签,无标签,无标签增广])
         mixed_input = interleave(mixed_input, batch_size)
-
-        logits = [model(mixed_input[0])]
-        for input in mixed_input[1:]:
+        # interleave打乱后再输入到模型中
+        logits = [model(mixed_input[0])] # 有监督混合一部分的无监督以及无监督增广
+        for input in mixed_input[1:]: # 混合一部分有监督的无监督 以及 混合一部分有监督的无监督增广
             logits.append(model(input))
-
+        # 再次调用interleave就会还原回去
         # put interleaved samples back
         logits = interleave(logits, batch_size)
         logits_x = logits[0]
         logits_u = torch.cat(logits[1:], dim=0)
 
+        # 调用SemiLoss
         Lx, Lu, w = criterion(logits_x, mixed_target[:batch_size], logits_u, mixed_target[batch_size:], epoch+batch_idx/args.train_iteration)
-
-        loss = Lx + w * Lu
+        # 计算最终loss
+        loss = Lx + w * Lu 
 
         # record loss
         losses.update(loss.item(), inputs_x.size(0))
@@ -284,7 +285,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         end = time.time()
 
         # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}\n'.format(
                     batch=batch_idx + 1,
                     size=args.train_iteration,
                     data=data_time.avg,
@@ -323,7 +324,7 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
                 inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
             # compute output
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets) # CELoss
 
             # measure accuracy and record loss
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
@@ -336,7 +337,7 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
             end = time.time()
 
             # plot progress
-            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+            bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}\n'.format(
                         batch=batch_idx + 1,
                         size=len(valloader),
                         data=data_time.avg,
@@ -368,10 +369,10 @@ class SemiLoss(object):
     def __call__(self, outputs_x, targets_x, outputs_u, targets_u, epoch):
         probs_u = torch.softmax(outputs_u, dim=1)
 
-        Lx = -torch.mean(torch.sum(F.log_softmax(outputs_x, dim=1) * targets_x, dim=1))
-        Lu = torch.mean((probs_u - targets_u)**2)
+        Lx = -torch.mean(torch.sum(F.log_softmax(outputs_x, dim=1) * targets_x, dim=1)) # L样本用CELoss, 公式3
+        Lu = torch.mean((probs_u - targets_u)**2) # U样本用L2 LOSS, 公式4
 
-        return Lx, Lu, args.lambda_u * linear_rampup(epoch)
+        return Lx, Lu, args.lambda_u * linear_rampup(epoch) # 返回公式5的(Lx, Lu, lambda), lambda随着训练逐渐减小
 
 class WeightEMA(object):
     def __init__(self, model, ema_model, alpha=0.999):
@@ -395,6 +396,7 @@ class WeightEMA(object):
                 param.mul_(1 - self.wd)
 
 def interleave_offsets(batch, nu):
+    # 返回[0,21,42,64]，也即batchsize等分成3块的pivot下标
     groups = [batch // (nu + 1)] * (nu + 1)
     for x in range(batch - sum(groups)):
         groups[-x - 1] += 1

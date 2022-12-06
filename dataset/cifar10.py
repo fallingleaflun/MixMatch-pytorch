@@ -5,6 +5,7 @@ import torchvision
 import torch
 
 class TransformTwice:
+    # 一个无标签样本会增广两次并输出
     def __init__(self, transform):
         self.transform = transform
 
@@ -30,6 +31,7 @@ def get_cifar10(root, n_labeled,
     
 
 def train_val_split(labels, n_labeled_per_class):
+    # 每类的均分有标签比例
     labels = np.array(labels)
     train_labeled_idxs = []
     train_unlabeled_idxs = []
@@ -122,11 +124,11 @@ class CIFAR10_labeled(torchvision.datasets.CIFAR10):
                  download=False):
         super(CIFAR10_labeled, self).__init__(root, train=train,
                  transform=transform, target_transform=target_transform,
-                 download=download)
+                 download=download) # 这个数据集本身就能直接做增广
         if indexs is not None:
             self.data = self.data[indexs]
             self.targets = np.array(self.targets)[indexs]
-        self.data = transpose(normalize(self.data))
+        self.data = transpose(normalize(self.data)) # 不懂为什么要转置
 
     def __getitem__(self, index):
         """
